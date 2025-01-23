@@ -1,6 +1,18 @@
 #-------------------------------------------------
-# 1. 匯入套件與基本設定
+# 本程式由Yuan-tao Huang製作，並基於以下專案開發而成：
+#   https://github.com/rtqichen/torchdiffeq/tree/master
+#   該專案主要提供完全運行於pytorch的積分器，但缺乏了自動產生ODEs的方法，需要人為手動輸入PyTorch版本的ODEs方程 q_ddot = f(q, q_dot)
+#
+# 本作品主要針對常見物理系統，透過歐拉-拉格朗日方程導出ODEs，過程使用SymPy套件進行符號運算，推導出運動方程式
+# 再透過自動替換產生ODEs，並交付PyTorch上的數值積分器進行積分。
+# 
+# 最主要的繁重計算負擔（積分）運行於GPU，且機械系統固定，因此可以針對大量不同初始條件做批量平行積分，大幅提高計算效率。
+# 由於完全基於PyTorch開發，且具有上述優勢，本方法可以用於穩定性分析、觀察系統混沌行為、暴力搜索簡單ODEs或是與機器學習/類神經網路結合。
+# 
+# 以下提供一個自動產生雙擺ODEs的方法，並進行大量（2^20）平行積分計算。
+# Yuan-tao Huang, 2025.01.10
 #-------------------------------------------------
+
 import sympy
 from sympy import symbols, Function, diff, sin, cos
 import torch
@@ -9,7 +21,7 @@ import matplotlib.pyplot as plt
 import time
 
 #-------------------------------------------------
-# 2. 在 Sympy 中自動推導「雙擺」方程
+# 1. 在 Sympy 中自動推導「雙擺」方程
 #-------------------------------------------------
 
 start_time = time.time()
@@ -56,7 +68,7 @@ theta2_dot_sym = diff(theta2_sym, t_sym)
 EL_eq1 = diff(Lag.diff(theta1_dot_sym), t_sym) - Lag.diff(theta1_sym)
 EL_eq2 = diff(Lag.diff(theta2_dot_sym), t_sym) - Lag.diff(theta2_sym)
 
-#--- (D) 簡化符號，簡化完可以大幅提昇計算效率 ---
+#--- (D) 簡化符號，簡化完可以提高計算效率 ---
 EL_eq1 = sympy.simplify(EL_eq1)
 EL_eq2 = sympy.simplify(EL_eq2)
 
@@ -73,12 +85,12 @@ theta2_ddot_expr = solutions[0][theta2_ddot_sym]  # α2(θ1, θ2, θ1_dot, θ2_d
 end_time = time.time()
 print(f"Symbolic derivation time: {end_time - start_time:.4f} s")
 
-print("自動推導完成：")
-print("θ1'' =", theta1_ddot_expr)
-print("θ2'' =", theta2_ddot_expr)
+print("\n========= ODEs =========")
+print("theta_1_ddot =", theta1_ddot_expr)
+print("theta_2_ddot =", theta2_ddot_expr)
 
 #-------------------------------------------------
-# 3. 將 Sympy expression 轉為 PyTorch 版 ODE 函式
+# 2. 將 Sympy expression 轉為 PyTorch 版 ODE 函式
 #    (字串替換 + exec 動態生成)
 #-------------------------------------------------
 
@@ -119,12 +131,12 @@ ns = {}
 exec(code_str, ns)
 alpha_func_torch = ns["alpha_func_torch"]
 
-# 顯示產生的函式代碼 (可選)
+
 print("\n========= Generated alpha_func_torch code_str =========")
 print(code_str)
 
 #-------------------------------------------------
-# 4. 定義 PyTorch ODE 函式 (double_pendulum_ode)
+# 3. 定義 PyTorch ODE 函式 (double_pendulum_ode)
 #    在 GPU 上運算
 #-------------------------------------------------
 def double_pendulum_ode_torch(t, Y):
@@ -159,42 +171,44 @@ def double_pendulum_ode_torch(t, Y):
     return torch.stack([omega1_batch, alpha1, omega2_batch, alpha2], dim=1)
 
 #-------------------------------------------------
-# 5. 進行大批量 (65536) 積分測試
+# 4. 進行大批量 (1048576) 積分測試
 #-------------------------------------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
-batch_size = 65536
+batch_size = 1048576
 
 #--- (A) 隨機生成初始條件 [θ1, ω1, θ2, ω2] ---
-#   θ1, θ2 ∈ [0, 2π), ω1, ω2 為 N(0,1) 分佈 (可自行調整)
+#   θ1, θ2 ∈ [0, 2π), ω1, ω2 為 N(0,1) 分佈
 theta1_init = 2*torch.pi*torch.rand(batch_size)
 theta2_init = 2*torch.pi*torch.rand(batch_size)
 omega1_init = torch.randn(batch_size)
 omega2_init = torch.randn(batch_size)
 
-# 組合成 (batch_size, 4)，上 GPU
+# 組合成 (batch_size, 4)，傳給GPU
 y0 = torch.stack([theta1_init, omega1_init, theta2_init, omega2_init], dim=1).to(device)
 
 # 時間軸: 0~3 秒, 301 個輸出點
 t = torch.linspace(0, 3, 301, device=device)
 
-start_time = time.time()
+print("\n========= Start Simulation =========")
 
+start_time = time.time()
 #--- (B) 使用 torchdiffeq 的 odeint 做數值積分 ---
 with torch.no_grad():
     solution = odeint(double_pendulum_ode_torch, y0, t, method='rk4') #rk4 or dopri5
-print(f"Total GPU memory for simulate {batch_size} double pendulum systems {torch.cuda.memory_reserved(0)}.")
 end_time = time.time()
 
+print(f"Total GPU memory for simulate {batch_size} double pendulum systems {torch.cuda.memory_reserved(0)}.")
+
 # 顯示解的形狀與執行時間
-print("Solution shape:", solution.shape)  # (501, 65536, 4)
+print("Solution shape:", solution.shape)  # (time, batch size, 2x order of ODEs)
 print(f"Total simulation time: {end_time - start_time:.4f} s")
 
 #-------------------------------------------------
-# 6. 繪圖: 只畫第 1 條 (index=0) 與第 100 條 (index=99) 雙擺末端的 (x2,y2)
+# 5. 繪圖: 只畫第 1 條 (index=0) 與第 100 條 (index=99) 雙擺末端的 (x2,y2)
 #-------------------------------------------------
 
-# 對應第 i 條: solution[:, i, :] => shape=(501, 4) = [θ1(t), ω1(t), θ2(t), ω2(t)]
-# 先定義一個函式來計算末端 x2, y2
+# 對應第 i 條: solution[:, i, :]
+# 定義一個函式來計算末端 x2, y2
 def get_xy2(theta1, theta2, l1_val, l2_val):
     """
     根據 θ1(t), θ2(t), l1, l2
@@ -207,12 +221,12 @@ def get_xy2(theta1, theta2, l1_val, l2_val):
     return x2_, y2_
 
 # 取出第 0 條(第一條)與第 99 條(第一百條)的 θ1, θ2 時序
-theta1_0 = solution[:, 0, 0]  # shape=(501,)
+theta1_0 = solution[:, 0, 0]  # shape=(time,)
 theta2_0 = solution[:, 0, 2]
 theta1_99 = solution[:, 99, 0]
 theta2_99 = solution[:, 99, 2]
 
-# 假設 l1=1, l2=1 (跟上面相同)
+# 假設 l1=1, l2=1
 l1_val = 1.0
 l2_val = 1.0
 
